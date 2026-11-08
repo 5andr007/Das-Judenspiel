@@ -1,0 +1,485 @@
+// Kartenspiel Online-Server – alles in dieser einen Datei.
+// Start: node server.txt   (Port kommt vom Hoster, lokal 3000)
+// Online-Server für das Kartenspiel. Nur eingebaute Node.js-Module, keine Pakete nötig.
+const http = require('http');
+const fs = require('fs');
+const path = require('path');
+const crypto = require('crypto');
+const E = (function () {
+const module = { exports: {} };
+// Spiellogik ohne Oberfläche. Wird vom Server genutzt (und kann im Browser geladen werden).
+(function (root, factory) {
+  const api = factory();
+  if (typeof module !== 'undefined' && module.exports) module.exports = api;
+  else root.KartenEngine = api;
+})(typeof globalThis !== 'undefined' ? globalThis : this, function () {
+  const RANKS = ['2', '4', '5', '6', '7', '8', '9', '10', 'B', 'D', 'K', '3', 'A'];
+  const SUITS = ['♠', '♥', '♦', '♣'];
+
+  const strength = r => RANKS.indexOf(r);
+  const sortHand = h => h.sort((a, b) => strength(b.r) - strength(a.r)); // stärkste zuerst
+  const emptyPile = () => ({ cards: [], count: 0, rank: null, last: null });
+  const fresh = name => ({ name, hand: [], finished: false, exInfo: { got: [], gave: [] } });
+
+  function buildDeck() {
+    const d = [];
+    for (const s of SUITS) for (const r of RANKS) d.push({ r, s });
+    return d;
+  }
+  function shuffle(a) {
+    for (let i = a.length - 1; i > 0; i--) {
+      const j = Math.floor(Math.random() * (i + 1));
+      [a[i], a[j]] = [a[j], a[i]];
+    }
+    return a;
+  }
+  function validIdx(idxs, len) {
+    if (!Array.isArray(idxs) || idxs.length === 0) return false;
+    const seen = new Set();
+    for (const i of idxs) {
+      if (!Number.isInteger(i) || i < 0 || i >= len || seen.has(i)) return false;
+      seen.add(i);
+    }
+    return true;
+  }
+
+  function newEngine(names) {
+    return {
+      players: names.map(fresh), round: 0, lastRanking: null, phase: 'lobby',
+      current: null, pile: emptyPile(), pass: 0, finishOrder: [], exQueue: [], ranking: null, msg: ''
+    };
+  }
+
+  // Index des Spielers, der gerade handeln muss (oder null)
+  function actor(G) {
+    if (!G) return null;
+    if (G.phase === 'exchange') return G.exQueue[0].from;
+    if (G.phase === 'play') return G.current;
+    return null;
+  }
+
+  function nextActive(G, i) {
+    const n = G.players.length;
+    for (let k = 1; k <= n; k++) {
+      const j = (i + k) % n;
+      if (!G.players[j].finished) return j;
+    }
+    return i;
+  }
+
+  function countOthers(G) {
+    return G.players.filter((p, i) => !p.finished && i !== G.pile.last).length;
+  }
+
+  function startPlay(G, s) {
+    G.phase = 'play'; G.pile = emptyPile(); G.pass = 0; G.current = s;
+  }
+
+  function startRound(G) {
+    const n = G.players.length;
+    G.round++;
+    G.players.forEach(p => { p.hand = []; p.finished = false; p.exInfo = { got: [], gave: [] }; });
+    shuffle(buildDeck()).forEach((c, i) => G.players[i % n].hand.push(c));
+    G.players.forEach(p => sortHand(p.hand));
+    G.finishOrder = []; G.ranking = null; G.pile = emptyPile(); G.pass = 0; G.exQueue = [];
+    if (G.lastRanking) {
+      doAutoExchange(G);
+    } else {
+      const s = Math.floor(Math.random() * n);
+      G.msg = `Runde ${G.round}: ${G.players[s].name} beginnt.`;
+      startPlay(G, s);
+    }
+  }
+
+  // Neue Spieler stehen unten, in Beitrittsreihenfolge (später = weiter unten).
+  function nextRound(G, newNames) {
+    const old = G.players.length;
+    newNames.forEach(nm => G.players.push(fresh(nm)));
+    G.lastRanking = [...G.ranking, ...newNames.map((_, k) => old + k)];
+    startRound(G);
+  }
+
+  // ---- Tausch ----
+  function takeBest(G, from, to, k) {
+    const P = G.players;
+    const cards = P[from].hand.splice(0, k);
+    P[to].hand.push(...cards);
+    P[from].exInfo.gave.push({ who: P[to].name, cards });
+    P[to].exInfo.got.push({ who: P[from].name, cards });
+    sortHand(P[to].hand); sortHand(P[from].hand);
+  }
+
+  function doAutoExchange(G) {
+    const R = G.lastRanking, n = R.length;
+    const F = R[0], S2 = R[1], V = R[n - 2], L = R[n - 1];
+    takeBest(G, L, F, 2);
+    takeBest(G, V, S2, 1);
+    G.exQueue = [{ from: F, to: L, count: 2 }, { from: S2, to: V, count: 1 }];
+    G.phase = 'exchange';
+    G.msg = `Tausch: ${G.players[L].name} gibt ${G.players[F].name} die 2 besten Karten, ${G.players[V].name} gibt ${G.players[S2].name} die beste Karte.`;
+  }
+
+  function applyExchange(G, q, idxs) {
+    const P = G.players;
+    const cards = [...idxs].sort((a, b) => b - a).map(i => P[q.from].hand.splice(i, 1)[0]);
+    P[q.to].hand.push(...cards);
+    P[q.from].exInfo.gave.push({ who: P[q.to].name, cards });
+    P[q.to].exInfo.got.push({ who: P[q.from].name, cards });
+    sortHand(P[q.to].hand); sortHand(P[q.from].hand);
+    G.exQueue.shift();
+    if (G.exQueue.length) {
+      G.msg = `${P[q.from].name} hat abgegeben.`;
+    } else {
+      G.msg = `Tausch abgeschlossen. ${G.players[G.lastRanking[0]].name} beginnt.`;
+      startPlay(G, G.lastRanking[0]);
+    }
+  }
+
+  function exchange(G, idx, idxs) {
+    if (G.phase !== 'exchange') return 'Gerade ist kein Tausch.';
+    const q = G.exQueue[0];
+    if (idx !== q.from) return 'Du bist nicht dran.';
+    if (!validIdx(idxs, G.players[idx].hand.length) || idxs.length !== q.count) return `Wähle genau ${q.count} Karte(n).`;
+    applyExchange(G, q, idxs);
+    return null;
+  }
+
+  // Spieler offline: die schwächsten Karten werden automatisch abgegeben
+  function forceExchange(G, idx) {
+    if (G.phase !== 'exchange') return;
+    const q = G.exQueue[0];
+    if (idx !== q.from) return;
+    const len = G.players[idx].hand.length, idxs = [];
+    for (let i = len - q.count; i < len; i++) idxs.push(i);
+    G.msg = `${G.players[idx].name} ist offline: die schwächsten Karten werden abgegeben.`;
+    applyExchange(G, q, idxs);
+  }
+
+  // ---- Spiel ----
+  function advance(G, from) {
+    if (G.pile.count > 0 && G.pass >= countOthers(G)) {
+      let leader = G.pile.last;
+      if (G.players[leader].finished) leader = nextActive(G, leader);
+      G.pile = emptyPile(); G.pass = 0; G.current = leader;
+      G.msg = `Stapel geräumt. ${G.players[leader].name} eröffnet den nächsten Stapel.`;
+      return;
+    }
+    G.current = nextActive(G, from);
+  }
+
+  function endRound(G) {
+    const rest = G.players.map((p, i) => i).filter(i => !G.players[i].finished);
+    G.ranking = [...G.finishOrder, ...rest];
+    G.phase = 'roundover'; G.current = null; G.pile = emptyPile();
+    G.msg = `Runde ${G.round} beendet.`;
+  }
+
+  function play(G, idx, idxs) {
+    if (G.phase !== 'play') return 'Gerade wird nicht gespielt.';
+    if (idx !== G.current) return 'Du bist nicht am Zug.';
+    const p = G.players[idx];
+    if (!validIdx(idxs, p.hand.length)) return 'Ungültige Auswahl.';
+    const cards = idxs.map(i => p.hand[i]);
+    const rank = cards[0].r;
+    if (cards.some(c => c.r !== rank)) return 'Nur Karten gleichen Werts gleichzeitig.';
+    const k = cards.length;
+    if (G.pile.count > 0) {
+      if (k !== G.pile.count) return `Du musst genau ${G.pile.count} Karte(n) legen.`;
+      if (strength(rank) < strength(G.pile.rank)) return 'Diese Karte ist zu schwach.';
+    }
+    const same = G.pile.count > 0 && rank === G.pile.rank;
+
+    [...idxs].sort((a, b) => b - a).forEach(i => p.hand.splice(i, 1));
+    sortHand(p.hand);
+    G.msg = `${p.name} legt ${k}× ${rank}.`;
+
+    if (p.hand.length === 0) { p.finished = true; G.finishOrder.push(idx); }
+    if (G.players.filter(q => !q.finished).length <= 1) { endRound(G); return null; }
+
+    // Ass oder letzte Karte beendet den Stapel sofort
+    if (rank === 'A' || p.finished) {
+      G.pile = emptyPile(); G.pass = 0;
+      G.current = p.finished ? nextActive(G, idx) : idx;
+      G.msg += rank === 'A' ? ' Das Ass räumt den Stapel ab.' : ' Letzte Karte: Der Stapel ist beendet.';
+      return null;
+    }
+
+    G.pile = { cards, count: k, rank, last: idx };
+    G.pass = 0;
+    let from = idx;
+    if (same) {
+      from = nextActive(G, idx);
+      G.pass = 1; // der übersprungene Spieler zählt wie ein Passen
+      G.msg += ` ${G.players[from].name} wird übersprungen.`;
+    }
+    advance(G, from);
+    return null;
+  }
+
+  function pass(G, idx) {
+    if (G.phase !== 'play') return 'Gerade wird nicht gespielt.';
+    if (idx !== G.current) return 'Du bist nicht am Zug.';
+    if (G.pile.count === 0) return 'Du musst eröffnen.';
+    G.pass++;
+    G.msg = `${G.players[idx].name} passt.`;
+    advance(G, idx);
+    return null;
+  }
+
+  // Spieler offline und am Zug
+  function forcePass(G, idx) {
+    if (G.phase !== 'play' || idx !== G.current) return;
+    if (G.pile.count > 0) {
+      G.pass++;
+      G.msg = `${G.players[idx].name} ist offline und wird übersprungen.`;
+      advance(G, idx);
+    } else {
+      G.current = nextActive(G, idx);
+      G.msg = `${G.players[idx].name} ist offline, ${G.players[G.current].name} eröffnet.`;
+    }
+  }
+
+  return { newEngine, startRound, nextRound, play, pass, forcePass, exchange, forceExchange, actor, RANKS, strength };
+});
+
+return module.exports;
+})();
+
+const HTML_B64 = 'PCFET0NUWVBFIGh0bWw+CjxodG1sIGxhbmc9ImRlIj4KPGhlYWQ+CjxtZXRhIGNoYXJzZXQ9IlVURi04Ij4KPG1ldGEgbmFtZT0idmlld3BvcnQiIGNvbnRlbnQ9IndpZHRoPWRldmljZS13aWR0aCxpbml0aWFsLXNjYWxlPTEiPgo8dGl0bGU+S2FydGVuc3BpZWwg4oCTIE9ubGluZTwvdGl0bGU+CjxzdHlsZT4KKntib3gtc2l6aW5nOmJvcmRlci1ib3h9CmJvZHl7bWFyZ2luOjA7Zm9udC1mYW1pbHk6c3lzdGVtLXVpLC1hcHBsZS1zeXN0ZW0sU2Vnb2UgVUksc2Fucy1zZXJpZjtiYWNrZ3JvdW5kOiMxZjZmM2Y7Y29sb3I6I2ZmZjttaW4taGVpZ2h0OjEwMHZofQpoZWFkZXJ7cGFkZGluZzoxMnB4IDE2cHg7YmFja2dyb3VuZDpyZ2JhKDAsMCwwLC4yNSk7ZGlzcGxheTpmbGV4O2p1c3RpZnktY29udGVudDpzcGFjZS1iZXR3ZWVuO2FsaWduLWl0ZW1zOmNlbnRlcjtmbGV4LXdyYXA6d3JhcDtnYXA6OHB4fQptYWlue3BhZGRpbmc6MTZweDttYXgtd2lkdGg6OTAwcHg7bWFyZ2luOjAgYXV0b30KYnV0dG9ue2ZvbnQ6aW5oZXJpdDtwYWRkaW5nOjEwcHggMTZweDtib3JkZXI6MDtib3JkZXItcmFkaXVzOjhweDtiYWNrZ3JvdW5kOiNmZmY7Y29sb3I6IzFmNmYzZjtjdXJzb3I6cG9pbnRlcjtmb250LXdlaWdodDo2MDA7bWFyZ2luOjRweCAwfQpidXR0b24uYWx0e2JhY2tncm91bmQ6I2ZmZDk2Njtjb2xvcjojMzMzfQppbnB1dHtmb250OmluaGVyaXQ7cGFkZGluZzo4cHg7Ym9yZGVyLXJhZGl1czo2cHg7Ym9yZGVyOjFweCBzb2xpZCAjY2NjO21hcmdpbjo0cHggMDtkaXNwbGF5OmJsb2NrO3dpZHRoOjEwMCU7bWF4LXdpZHRoOjMyMHB4fQoudGFibGV7YmFja2dyb3VuZDpyZ2JhKDAsMCwwLC4yKTtib3JkZXItcmFkaXVzOjEycHg7cGFkZGluZzoxNnB4O21hcmdpbjoxMnB4IDB9Ci5tc2d7YmFja2dyb3VuZDpyZ2JhKDAsMCwwLC4zKTtib3JkZXItcmFkaXVzOjhweDtwYWRkaW5nOjEwcHg7bWFyZ2luOjhweCAwfQouaGFuZHtkaXNwbGF5OmZsZXg7ZmxleC13cmFwOndyYXA7Z2FwOjhweDttYXJnaW4tdG9wOjhweH0KLmNhcmR7d2lkdGg6NjRweDtoZWlnaHQ6OTBweDtiYWNrZ3JvdW5kOiNmZmY7Y29sb3I6IzIyMjtib3JkZXItcmFkaXVzOjhweDtkaXNwbGF5OmZsZXg7ZmxleC1kaXJlY3Rpb246Y29sdW1uO2FsaWduLWl0ZW1zOmNlbnRlcjtqdXN0aWZ5LWNvbnRlbnQ6Y2VudGVyO2ZvbnQtd2VpZ2h0OjcwMDtmb250LXNpemU6MjBweDtib3JkZXI6M3B4IHNvbGlkIHRyYW5zcGFyZW50O2N1cnNvcjpwb2ludGVyO3VzZXItc2VsZWN0Om5vbmV9Ci5jYXJkIHNtYWxse2ZvbnQtc2l6ZToyMHB4fQouY2FyZC5yZWR7Y29sb3I6I2M2MjgyOH0KLmNhcmQuc2Vse2JvcmRlci1jb2xvcjojZmZkOTY2O3RyYW5zZm9ybTp0cmFuc2xhdGVZKC0xMHB4KX0KLnBpbGUgLmNhcmR7Y3Vyc29yOmRlZmF1bHR9Ci5wbGFjZXN7Zm9udC1zaXplOjE0cHg7b3BhY2l0eTouOX0KdWwsb2x7cGFkZGluZy1sZWZ0OjIwcHh9Cmxpe21hcmdpbjo0cHggMH0KdGFibGUuc3RhdHN7Ym9yZGVyLWNvbGxhcHNlOmNvbGxhcHNlO21hcmdpbi10b3A6OHB4fQp0YWJsZS5zdGF0cyB0ZCx0YWJsZS5zdGF0cyB0aHtwYWRkaW5nOjRweCAxMnB4O3RleHQtYWxpZ246bGVmdDtib3JkZXItYm90dG9tOjFweCBzb2xpZCByZ2JhKDI1NSwyNTUsMjU1LC4yKX0KPC9zdHlsZT4KPC9oZWFkPgo8Ym9keT4KPGhlYWRlcj48c3Ryb25nPkthcnRlbnNwaWVsIOKAkyBPbmxpbmU8L3N0cm9uZz48c3BhbiBpZD0ic3RhdHVzIj48L3NwYW4+PC9oZWFkZXI+CjxtYWluIGlkPSJhcHAiPjwvbWFpbj4KPHNjcmlwdD4KY29uc3QgTFMgPSAna2FydGVuc3BpZWwtb25saW5lJzsKY29uc3QgUkVEID0gcyA9PiBzID09PSAn4pmlJyB8fCBzID09PSAn4pmmJzsKY29uc3QgZXNjID0gcyA9PiBTdHJpbmcocykucmVwbGFjZSgvWyY8PiJdL2csIGMgPT4gKHsnJic6JyZhbXA7JywnPCc6JyZsdDsnLCc+JzonJmd0OycsJyInOicmcXVvdDsnfVtjXSkpOwoKbGV0IFMgPSBudWxsLCBlcyA9IG51bGwsIHNlbCA9IG5ldyBTZXQoKSwgaGFuZEtleSA9ICcnLCBlcnIgPSAnJzsKCmNvbnN0IHNhdmVkID0gKCkgPT4gSlNPTi5wYXJzZShsb2NhbFN0b3JhZ2UuZ2V0SXRlbShMUykgfHwgJ251bGwnKTsKZnVuY3Rpb24gc2V0U2F2ZWQodikgeyB2ID8gbG9jYWxTdG9yYWdlLnNldEl0ZW0oTFMsIEpTT04uc3RyaW5naWZ5KHYpKSA6IGxvY2FsU3RvcmFnZS5yZW1vdmVJdGVtKExTKTsgfQoKZnVuY3Rpb24gY29ubmVjdChjb2RlLCB0b2tlbikgewogIGlmIChlcykgZXMuY2xvc2UoKTsKICBlcyA9IG5ldyBFdmVudFNvdXJjZShgL2FwaS9ldmVudHM/Y29kZT0ke2VuY29kZVVSSUNvbXBvbmVudChjb2RlKX0mdG9rZW49JHtlbmNvZGVVUklDb21wb25lbnQodG9rZW4pfWApOwogIGVzLm9ubWVzc2FnZSA9IGUgPT4gewogICAgUyA9IEpTT04ucGFyc2UoZS5kYXRhKTsKICAgIGVyciA9ICcnOwogICAgY29uc3Qga2V5ID0gSlNPTi5zdHJpbmdpZnkoUy5oYW5kKTsKICAgIGlmIChrZXkgIT09IGhhbmRLZXkpIHsgaGFuZEtleSA9IGtleTsgc2VsID0gbmV3IFNldCgpOyB9CiAgICByZW5kZXIoKTsKICB9OwogIGVzLm9uZXJyb3IgPSAoKSA9PiB7CiAgICBpZiAoZXMucmVhZHlTdGF0ZSA9PT0gRXZlbnRTb3VyY2UuQ0xPU0VEKSB7CiAgICAgIHNldFNhdmVkKG51bGwpOyBTID0gbnVsbDsgZXMgPSBudWxsOwogICAgICBlcnIgPSAnRGllIFBhcnR5IGV4aXN0aWVydCBuaWNodCBtZWhyLic7CiAgICAgIHJlbmRlcigpOwogICAgfQogIH07Cn0KCmFzeW5jIGZ1bmN0aW9uIGFwaSh1cmwsIGJvZHkpIHsKICBjb25zdCByID0gYXdhaXQgZmV0Y2godXJsLCB7IG1ldGhvZDogJ1BPU1QnLCBoZWFkZXJzOiB7ICdDb250ZW50LVR5cGUnOiAnYXBwbGljYXRpb24vanNvbicgfSwgYm9keTogSlNPTi5zdHJpbmdpZnkoYm9keSkgfSk7CiAgY29uc3QgaiA9IGF3YWl0IHIuanNvbigpLmNhdGNoKCgpID0+ICh7fSkpOwogIGlmICghci5vaykgeyBlcnIgPSBqLmVycm9yIHx8ICdGZWhsZXIuJzsgcmVuZGVyKCk7IHJldHVybiBudWxsOyB9CiAgcmV0dXJuIGo7Cn0KCmFzeW5jIGZ1bmN0aW9uIGNyZWF0ZVBhcnR5KCkgewogIGNvbnN0IGogPSBhd2FpdCBhcGkoJy9hcGkvY3JlYXRlJywgeyBuYW1lOiBkb2N1bWVudC5nZXRFbGVtZW50QnlJZCgnbjEnKS52YWx1ZS50cmltKCkgfSk7CiAgaWYgKCFqKSByZXR1cm47CiAgc2V0U2F2ZWQoeyBjb2RlOiBqLmNvZGUsIHRva2VuOiBqLnRva2VuIH0pOwogIGNvbm5lY3Qoai5jb2RlLCBqLnRva2VuKTsKfQoKYXN5bmMgZnVuY3Rpb24gam9pblBhcnR5KCkgewogIGNvbnN0IGogPSBhd2FpdCBhcGkoJy9hcGkvam9pbicsIHsKICAgIGNvZGU6IGRvY3VtZW50LmdldEVsZW1lbnRCeUlkKCdjMicpLnZhbHVlLnRyaW0oKS50b1VwcGVyQ2FzZSgpLAogICAgbmFtZTogZG9jdW1lbnQuZ2V0RWxlbWVudEJ5SWQoJ24yJykudmFsdWUudHJpbSgpCiAgfSk7CiAgaWYgKCFqKSByZXR1cm47CiAgc2V0U2F2ZWQoeyBjb2RlOiBqLmNvZGUsIHRva2VuOiBqLnRva2VuIH0pOwogIGNvbm5lY3Qoai5jb2RlLCBqLnRva2VuKTsKfQoKYXN5bmMgZnVuY3Rpb24gYWN0KHR5cGUsIGV4dHJhID0ge30pIHsKICBjb25zdCBzID0gc2F2ZWQoKTsKICBpZiAoIXMpIHJldHVybiBudWxsOwogIGVyciA9ICcnOwogIGNvbnN0IGogPSBhd2FpdCBhcGkoJy9hcGkvYWN0aW9uJywgeyBjb2RlOiBzLmNvZGUsIHRva2VuOiBzLnRva2VuLCB0eXBlLCAuLi5leHRyYSB9KTsKICBpZiAoIWopIHJldHVybiBudWxsOwogIHJldHVybiBqOwp9Cgphc3luYyBmdW5jdGlvbiBsZWF2ZVBhcnR5KCkgewogIGNvbnN0IGogPSBhd2FpdCBhY3QoJ2xlYXZlJyk7CiAgaWYgKGopIGxlYXZlTG9jYWwoKTsKfQoKZnVuY3Rpb24gZW5kUGFydHkoKSB7CiAgaWYgKGNvbmZpcm0oJ1BhcnR5IHdpcmtsaWNoIGJlZW5kZW4/JykpIGFjdCgnZW5kJyk7Cn0KCmZ1bmN0aW9uIGxlYXZlTG9jYWwoKSB7CiAgc2V0U2F2ZWQobnVsbCk7CiAgaWYgKGVzKSBlcy5jbG9zZSgpOwogIGVzID0gbnVsbDsgUyA9IG51bGw7IHNlbCA9IG5ldyBTZXQoKTsKICByZW5kZXIoKTsKfQoKZnVuY3Rpb24gY2FuUGljaygpIHsKICByZXR1cm4gUyAmJiBTLnBoYXNlICE9PSAncm91bmRvdmVyJyAmJiAhUy5lbmRlZCAmJiAoUy55b3VBY3QgfHwgKFMuZXhjaGFuZ2UgJiYgUy5leGNoYW5nZS55b3VHaXZlKSk7Cn0KZnVuY3Rpb24gdGFwKGkpIHsKICBpZiAoIWNhblBpY2soKSkgcmV0dXJuOwogIGlmIChzZWwuaGFzKGkpKSBzZWwuZGVsZXRlKGkpOyBlbHNlIHNlbC5hZGQoaSk7CiAgcmVuZGVyKCk7Cn0KCmZ1bmN0aW9uIGNhcmRIVE1MKGMsIGksIHNlbGVjdGVkKSB7CiAgY29uc3QgY2xpY2sgPSBpID09PSBudWxsID8gJycgOiBgIG9uY2xpY2s9InRhcCgke2l9KSJgOwogIHJldHVybiBgPGRpdiBjbGFzcz0iY2FyZCR7UkVEKGMucykgPyAnIHJlZCcgOiAnJ30ke3NlbGVjdGVkID8gJyBzZWwnIDogJyd9IiR7Y2xpY2t9PiR7Yy5yfTxzbWFsbD4ke2Muc308L3NtYWxsPjwvZGl2PmA7Cn0KCmZ1bmN0aW9uIGZtdChjYXJkcykgewogIHJldHVybiBjYXJkcy5tYXAoYyA9PiBjLnIgKyBjLnMpLmpvaW4oJyAnKTsKfQoKZnVuY3Rpb24gc3RhdHNUYWJsZSgpIHsKICBjb25zdCByb3dzID0gUy5tZW1iZXJzLm1hcChtID0+IGA8dHI+PHRkPiR7ZXNjKG0ubmFtZSl9PC90ZD48dGQ+JHttLnN0YXRzLndpbnN9PC90ZD48dGQ+JHttLnN0YXRzLmxhc3RzfTwvdGQ+PHRkPiR7bS5zdGF0cy5yb3VuZHN9PC90ZD48L3RyPmApLmpvaW4oJycpOwogIHJldHVybiBgPHRhYmxlIGNsYXNzPSJzdGF0cyI+PHRyPjx0aD5OYW1lPC90aD48dGg+U2llZ2U8L3RoPjx0aD5MZXR6dGVyPC90aD48dGg+UnVuZGVuPC90aD48L3RyPiR7cm93c308L3RhYmxlPmA7Cn0KCmZ1bmN0aW9uIGhvbWVIVE1MKCkgewogIHJldHVybiBgPGRpdiBjbGFzcz0idGFibGUiPjxoMj5QYXJ0eSBlcnN0ZWxsZW48L2gyPgogICAgICA8aW5wdXQgaWQ9Im4xIiBwbGFjZWhvbGRlcj0iRGVpbiBOYW1lIiBtYXhsZW5ndGg9IjIwIj4KICAgICAgPGJ1dHRvbiBvbmNsaWNrPSJjcmVhdGVQYXJ0eSgpIj5QYXJ0eSBlcnN0ZWxsZW48L2J1dHRvbj48L2Rpdj4KICAgIDxkaXYgY2xhc3M9InRhYmxlIj48aDI+UGFydHkgYmVpdHJldGVuPC9oMj4KICAgICAgPGlucHV0IGlkPSJuMiIgcGxhY2Vob2xkZXI9IkRlaW4gTmFtZSIgbWF4bGVuZ3RoPSIyMCI+CiAgICAgIDxpbnB1dCBpZD0iYzIiIHBsYWNlaG9sZGVyPSJQYXJ0eS1Db2RlIiBtYXhsZW5ndGg9IjYiPgogICAgICA8YnV0dG9uIGNsYXNzPSJhbHQiIG9uY2xpY2s9ImpvaW5QYXJ0eSgpIj5CZWl0cmV0ZW48L2J1dHRvbj48L2Rpdj4KICAgIDxwIGNsYXNzPSJtc2ciPiR7ZXNjKGVycil9PC9wPmA7Cn0KCmZ1bmN0aW9uIGxvYmJ5SFRNTCgpIHsKICBjb25zdCBuID0gUy5tZW1iZXJzLmxlbmd0aDsKICBjb25zdCBsaXN0ID0gUy5tZW1iZXJzLm1hcChtID0+IGA8bGk+JHtlc2MobS5uYW1lKX0ke20uaXNIb3N0ID8gJyAoSG9zdCknIDogJyd9IOKAkyAke20uY29ubmVjdGVkID8gJ29ubGluZScgOiAnb2ZmbGluZSd9PC9saT5gKS5qb2luKCcnKTsKICBjb25zdCBob3N0QnRucyA9IFMueW91LmlzSG9zdAogICAgPyBgPGJ1dHRvbiBvbmNsaWNrPSJhY3QoJ3N0YXJ0JykiPlNwaWVsIHN0YXJ0ZW48L2J1dHRvbj4gPGJ1dHRvbiBjbGFzcz0iYWx0IiBvbmNsaWNrPSJlbmRQYXJ0eSgpIj5QYXJ0eSBiZWVuZGVuPC9idXR0b24+YAogICAgOiAnPHA+V2FydGUsIGJpcyBkZXIgSG9zdCBkYXMgU3BpZWwgc3RhcnRldC48L3A+JzsKICByZXR1cm4gYDxkaXYgY2xhc3M9InRhYmxlIj48aDI+TG9iYnk8L2gyPgogICAgICA8cD5QYXJ0eS1Db2RlOiA8c3Ryb25nPiR7ZXNjKFMuY29kZSl9PC9zdHJvbmc+LiBUZWlsZSBpaG4gbWl0IGRlaW5lbiBGcmV1bmRlbi48L3A+CiAgICAgIDx1bD4ke2xpc3R9PC91bD4KICAgICAgPHAgY2xhc3M9InBsYWNlcyI+JHtuIDwgNCA/IGBOb2NoICR7NCAtIG59IFNwaWVsZXIgbsO2dGlnLmAgOiAnQmVyZWl0IHp1bSBTdGFydC4nfTwvcD4KICAgICAgJHtob3N0QnRuc30KICAgICAgPGJ1dHRvbiBjbGFzcz0iYWx0IiBvbmNsaWNrPSJsZWF2ZVBhcnR5KCkiPlBhcnR5IHZlcmxhc3NlbjwvYnV0dG9uPjwvZGl2PgogICAgPHAgY2xhc3M9Im1zZyI+JHtlc2MoZXJyKX08L3A+YDsKfQoKZnVuY3Rpb24gcm91bmRIVE1MKCkgewogIGNvbnN0IHJhbmsgPSBTLnJhbmtpbmcubWFwKChuLCBrKSA9PiBgPGxpPiR7ayArIDF9LiAke2VzYyhuKX08L2xpPmApLmpvaW4oJycpOwogIGNvbnN0IGhvc3RCdG5zID0gUy55b3UuaXNIb3N0CiAgICA/IGA8YnV0dG9uIG9uY2xpY2s9ImFjdCgnbmV4dFJvdW5kJykiPk7DpGNoc3RlIFJ1bmRlPC9idXR0b24+IDxidXR0b24gY2xhc3M9ImFsdCIgb25jbGljaz0iZW5kUGFydHkoKSI+UGFydHkgYmVlbmRlbjwvYnV0dG9uPmAKICAgIDogJzxwPldhcnRlLCBiaXMgZGVyIEhvc3QgZGllIG7DpGNoc3RlIFJ1bmRlIHN0YXJ0ZXQuPC9wPic7CiAgcmV0dXJuIGA8ZGl2IGNsYXNzPSJ0YWJsZSI+PGgyPlJ1bmRlICR7Uy5yb3VuZH0gYmVlbmRldDwvaDI+CiAgICAgIDxvbD4ke3Jhbmt9PC9vbD4KICAgICAgPHAgY2xhc3M9InBsYWNlcyI+TsOkY2hzdGUgUnVuZGU6IERlciBMZXR6dGUgZ2lidCBkZW0gRXJzdGVuIHNlaW5lIHp3ZWkgYmVzdGVuIEthcnRlbiwgZGVyIFZvcmxldHp0ZSBkZW0gWndlaXRlbiBzZWluZSBiZXN0ZS4gRGFuYWNoIGdpYnQgZGVyIEVyc3RlIHp3ZWkgYmVsaWViaWdlIEthcnRlbiB6dXLDvGNrLCBkZXIgWndlaXRlIGVpbmUuIERlciBFcnN0ZSBiZWdpbm50LjwvcD4KICAgICAgJHtob3N0QnRuc30KICAgICAgPGgzPlN0YXRpc3RpazwvaDM+JHtzdGF0c1RhYmxlKCl9PC9kaXY+CiAgICA8cCBjbGFzcz0ibXNnIj4ke2VzYyhlcnIpfTwvcD5gOwp9CgpmdW5jdGlvbiBlbmRlZEhUTUwoKSB7CiAgcmV0dXJuIGA8ZGl2IGNsYXNzPSJ0YWJsZSI+PGgyPlBhcnR5IGJlZW5kZXQ8L2gyPgogICAgICA8aDM+U3RhdGlzdGlrPC9oMz4ke3N0YXRzVGFibGUoKX0KICAgICAgPGJ1dHRvbiBvbmNsaWNrPSJsZWF2ZUxvY2FsKCkiPk5ldWUgUGFydHk8L2J1dHRvbj48L2Rpdj4KICAgIDxwIGNsYXNzPSJtc2ciPiR7ZXNjKGVycil9PC9wPmA7Cn0KCmZ1bmN0aW9uIGdhbWVIVE1MKCkgewogIGxldCBpbmZvOwogIGlmIChTLmV4Y2hhbmdlKSB7CiAgICBpbmZvID0gUy5leGNoYW5nZS55b3VHaXZlCiAgICAgID8gYFRhdXNjaDogV8OkaGxlICR7Uy5leGNoYW5nZS5jb3VudH0gS2FydGUobikgdW5kIGdpYiBzaWUgYW4gJHtlc2MoUy5leGNoYW5nZS50byl9LmAKICAgICAgOiBgVGF1c2NoIGzDpHVmdDogJHtlc2MoUy5leGNoYW5nZS5mcm9tKX0gZ2lidCAke1MuZXhjaGFuZ2UuY291bnR9IEthcnRlKG4pIGFuICR7ZXNjKFMuZXhjaGFuZ2UudG8pfS5gOwogIH0gZWxzZSBpZiAoUy55b3UucGVuZGluZykgewogICAgaW5mbyA9ICdEdSBiaXN0IGRhYmVpIHVuZCBzcGllbHN0IGFiIGRlciBuw6RjaHN0ZW4gUnVuZGUgbWl0Lic7CiAgfSBlbHNlIGlmIChTLnlvdUFjdCkgewogICAgaW5mbyA9IFMucGlsZS5jb3VudAogICAgICA/IGBEdSBiaXN0IGFtIFp1ZzogbGVnZSAke1MucGlsZS5jb3VudH0gS2FydGUobiksIG1pbmRlc3RlbnMgc28gc3Rhcmsgd2llICR7Uy5waWxlLnJhbmt9LCBvZGVyIHBhc3NlLmAKICAgICAgOiAnRHUgZXLDtmZmbmVzdCBkZW4gU3RhcGVsOiBsZWdlIEthcnRlbiBnbGVpY2hlbiBXZXJ0cy4nOwogIH0gZWxzZSB7CiAgICBpbmZvID0gYCR7ZXNjKFMubWVtYmVyc1tTLmN1cnJlbnRdPy5uYW1lIHx8ICcnKX0gaXN0IGFtIFp1Zy5gOwogIH0KICBpZiAoUy5kZWFkbGluZSkgaW5mbyArPSAnIERlciBTcGllbGVyIGFtIFp1ZyBpc3Qgb2ZmbGluZSB1bmQgd2lyZCBiYWxkIMO8YmVyc3BydW5nZW4sIGZhbGxzIGVyIG5pY2h0IHp1csO8Y2trb21tdC4nOwoKICBsZXQgYnV0dG9ucyA9ICcnOwogIGlmIChTLmV4Y2hhbmdlICYmIFMuZXhjaGFuZ2UueW91R2l2ZSkgewogICAgYnV0dG9ucyA9IGA8YnV0dG9uIG9uY2xpY2s9ImFjdCgnZXhjaGFuZ2UnLHtpZHhzOlsuLi5zZWxdfSkiPkFiZ2ViZW48L2J1dHRvbj5gOwogIH0gZWxzZSBpZiAoUy55b3VBY3QpIHsKICAgIGJ1dHRvbnMgPSBgPGJ1dHRvbiBvbmNsaWNrPSJhY3QoJ3BsYXknLHtpZHhzOlsuLi5zZWxdfSkiPkF1c3NwaWVsZW48L2J1dHRvbj5gOwogICAgaWYgKFMucGlsZS5jb3VudCkgYnV0dG9ucyArPSBgIDxidXR0b24gY2xhc3M9ImFsdCIgb25jbGljaz0iYWN0KCdwYXNzJykiPlBhc3NlbjwvYnV0dG9uPmA7CiAgfQogIGlmIChTLnlvdS5pc0hvc3QpIGJ1dHRvbnMgKz0gYCA8YnV0dG9uIGNsYXNzPSJhbHQiIG9uY2xpY2s9ImVuZFBhcnR5KCkiPlBhcnR5IGJlZW5kZW48L2J1dHRvbj5gOwoKICBjb25zdCBwaWxlSFRNTCA9IFMucGlsZS5jb3VudAogICAgPyBTLnBpbGUuY2FyZHMubWFwKGMgPT4gY2FyZEhUTUwoYywgbnVsbCwgZmFsc2UpKS5qb2luKCcnKQogICAgOiAnPHNwYW4gY2xhc3M9InBsYWNlcyI+S2VpbiBTdGFwZWwgbGllZ3QgYXVzLjwvc3Bhbj4nOwoKICBjb25zdCBwbGlzdCA9IFMubWVtYmVycy5tYXAobSA9PiB7CiAgICBjb25zdCBzdGF0dXMgPSBtLmZpbmlzaGVkID8gJ2ZlcnRpZycgOiBgJHttLmNhcmRzID8/IDB9IEthcnRlbmA7CiAgICBjb25zdCBvZmYgPSBtLmNvbm5lY3RlZCA/ICcnIDogJyAob2ZmbGluZSknOwogICAgY29uc3QgdHVybiA9IG0uaWR4ID09PSBTLmN1cnJlbnQgPyAnIOKXgCcgOiAnJzsKICAgIHJldHVybiBgPGxpPiR7ZXNjKG0ubmFtZSl9IOKAkyAke3N0YXR1c30ke29mZn0ke3R1cm59PC9saT5gOwogIH0pLmpvaW4oJycpOwoKICBjb25zdCBleCA9IFMuZXhJbmZvOwogIGNvbnN0IGV4QmxvY2sgPSAoZXguZ290Lmxlbmd0aCB8fCBleC5nYXZlLmxlbmd0aCkKICAgID8gYDxkaXYgY2xhc3M9Im1zZyI+PHN0cm9uZz5EZWluIFRhdXNjaCBpbiBkaWVzZXIgUnVuZGUgKG51ciBmw7xyIGRpY2gpOjwvc3Ryb25nPgogICAgICAgICAke2V4LmdvdC5tYXAoZSA9PiBgPGRpdj5FcmhhbHRlbiB2b24gJHtlc2MoZS53aG8pfTogJHtmbXQoZS5jYXJkcyl9PC9kaXY+YCkuam9pbignJyl9CiAgICAgICAgICR7ZXguZ2F2ZS5tYXAoZSA9PiBgPGRpdj5BYmdlZ2ViZW4gYW4gJHtlc2MoZS53aG8pfTogJHtmbXQoZS5jYXJkcyl9PC9kaXY+YCkuam9pbignJyl9CiAgICAgICA8L2Rpdj5gCiAgICA6ICcnOwoKICByZXR1cm4gYDxkaXYgY2xhc3M9InRhYmxlIj48cD4ke2luZm99PC9wPjxkaXYgY2xhc3M9ImhhbmQgcGlsZSI+JHtwaWxlSFRNTH08L2Rpdj48L2Rpdj4KICAgIDxkaXYgY2xhc3M9Im1zZyI+JHtlc2MoUy5tc2cpfTwvZGl2PgogICAgPGRpdiBjbGFzcz0idGFibGUiPjxwPjxzdHJvbmc+JHtlc2MoUy55b3UubmFtZSl9PC9zdHJvbmc+OiBkZWluZSBLYXJ0ZW4gKHN0w6Rya3N0ZSB6dWVyc3QpPC9wPgogICAgICAke2V4QmxvY2t9CiAgICAgIDxkaXYgY2xhc3M9ImhhbmQiPiR7Uy5oYW5kLm1hcCgoYywgaSkgPT4gY2FyZEhUTUwoYywgaSwgc2VsLmhhcyhpKSkpLmpvaW4oJycpfTwvZGl2PgogICAgICA8cD4ke2J1dHRvbnN9PC9wPjwvZGl2PgogICAgPGRpdiBjbGFzcz0idGFibGUiPjxzdHJvbmc+U3BpZWxlcjwvc3Ryb25nPjx1bD4ke3BsaXN0fTwvdWw+PC9kaXY+CiAgICA8cCBjbGFzcz0ibXNnIj4ke2VzYyhlcnIpfTwvcD5gOwp9CgpmdW5jdGlvbiByZW5kZXIoKSB7CiAgY29uc3QgYXBwID0gZG9jdW1lbnQuZ2V0RWxlbWVudEJ5SWQoJ2FwcCcpOwogIGRvY3VtZW50LmdldEVsZW1lbnRCeUlkKCdzdGF0dXMnKS50ZXh0Q29udGVudCA9IFMgPyBgUGFydHkgJHtTLmNvZGV9YCA6ICcnOwogIGlmICghUykgYXBwLmlubmVySFRNTCA9IGhvbWVIVE1MKCk7CiAgZWxzZSBpZiAoUy5lbmRlZCkgYXBwLmlubmVySFRNTCA9IGVuZGVkSFRNTCgpOwogIGVsc2UgaWYgKFMuc3RhdHVzID09PSAnbG9iYnknKSBhcHAuaW5uZXJIVE1MID0gbG9iYnlIVE1MKCk7CiAgZWxzZSBpZiAoUy5waGFzZSA9PT0gJ3JvdW5kb3ZlcicpIGFwcC5pbm5lckhUTUwgPSByb3VuZEhUTUwoKTsKICBlbHNlIGFwcC5pbm5lckhUTUwgPSBnYW1lSFRNTCgpOwp9CgovLyBTdGFydDogZ2VzcGVpY2hlcnRlIFBhcnR5IHdpZWRlciB2ZXJiaW5kZW4KKGZ1bmN0aW9uIGluaXQoKSB7CiAgY29uc3QgcyA9IHNhdmVkKCk7CiAgaWYgKHMpIGNvbm5lY3Qocy5jb2RlLCBzLnRva2VuKTsKICByZW5kZXIoKTsKfSkoKTsKPC9zY3JpcHQ+CjwvYm9keT4KPC9odG1sPgo=';
+const HTML = Buffer.from(HTML_B64, 'base64').toString('utf-8');
+const PORT = process.env.PORT || 3000;
+const DISCONNECT_MS = Number(process.env.DISCONNECT_MS) || 45000;
+const IDLE_MS = 2 * 60 * 60 * 1000; // Party ohne Verbindung nach 2 Stunden löschen
+const MAX_MEMBERS = 7;
+const parties = new Map();
+
+const randCode = () => {
+  const a = 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789';
+  let s = '';
+  for (let i = 0; i < 6; i++) s += a[crypto.randomInt(a.length)];
+  return s;
+};
+const randToken = () => crypto.randomBytes(16).toString('hex');
+
+function uniqueName(P, base) {
+  const name = (base || '').trim().slice(0, 20) || 'Spieler';
+  let cand = name, n = 2;
+  while (P.members.some(m => m.name.toLowerCase() === cand.toLowerCase())) cand = `${name} (${n++})`;
+  return cand;
+}
+
+function addMember(P, name) {
+  const m = { name: uniqueName(P, name), token: randToken(), sse: null, timer: null, deadline: null, wins: 0, lasts: 0, rounds: 0 };
+  P.members.push(m);
+  return m;
+}
+
+function send(res, obj) {
+  res.write(`data: ${JSON.stringify(obj)}\n\n`);
+}
+
+function json(res, status, obj) {
+  res.writeHead(status, { 'Content-Type': 'application/json; charset=utf-8' });
+  res.end(JSON.stringify(obj));
+}
+
+function recordRound(P) {
+  const r = P.G.ranking, n = r.length;
+  P.members[r[0]].wins++;
+  P.members[r[n - 1]].lasts++;
+  r.forEach(i => P.members[i].rounds++);
+}
+
+// Timer für Spieler, die am Zug und offline sind
+function syncTimers(P) {
+  const a = P.status === 'playing' && P.G ? E.actor(P.G) : null;
+  P.members.forEach((m, i) => {
+    const wait = i === a && !m.sse;
+    if (wait && !m.timer) {
+      m.deadline = Date.now() + DISCONNECT_MS;
+      m.timer = setTimeout(() => {
+        m.timer = null; m.deadline = null;
+        if (!P.G || E.actor(P.G) !== i || m.sse) return sync(P);
+        if (P.G.phase === 'exchange') E.forceExchange(P.G, i);
+        else E.forcePass(P.G, i);
+        afterEngine(P);
+      }, DISCONNECT_MS);
+    } else if (!wait && m.timer) {
+      clearTimeout(m.timer); m.timer = null; m.deadline = null;
+    }
+  });
+}
+
+function view(P, i) {
+  const G = P.G, m = P.members[i];
+  const a = G ? E.actor(G) : null;
+  const ex = G && G.phase === 'exchange' ? G.exQueue[0] : null;
+  return {
+    ver: P.ver,
+    code: P.code,
+    status: P.status,
+    ended: P.status === 'ended',
+    you: { idx: i, name: m.name, isHost: i === 0, pending: !!G && i >= G.players.length },
+    members: P.members.map((x, j) => ({
+      idx: j, name: x.name, connected: !!x.sse, isHost: j === 0,
+      cards: G && G.players[j] ? G.players[j].hand.length : null,
+      finished: !!(G && G.players[j] && G.players[j].finished),
+      stats: { wins: x.wins, lasts: x.lasts, rounds: x.rounds }
+    })),
+    phase: G ? G.phase : 'lobby',
+    round: G ? G.round : 0,
+    msg: G ? G.msg : '',
+    current: a,
+    youAct: !!G && G.phase === 'play' && G.current === i,
+    deadline: a !== null && !P.members[a].sse ? P.members[a].deadline : null,
+    hand: G && G.players[i] ? G.players[i].hand.map(c => ({ r: c.r, s: c.s })) : [],
+    exInfo: G && G.players[i] ? G.players[i].exInfo : { got: [], gave: [] },
+    pile: G ? { cards: G.pile.cards.map(c => ({ r: c.r, s: c.s })), rank: G.pile.rank, count: G.pile.count } : { cards: [], rank: null, count: 0 },
+    exchange: ex ? { from: G.players[ex.from].name, to: G.players[ex.to].name, count: ex.count, youGive: ex.from === i } : null,
+    ranking: G && G.phase === 'roundover' ? G.ranking.map(j => P.members[j].name) : null
+  };
+}
+
+function sync(P) {
+  P.ver = (P.ver || 0) + 1;
+  P.lastActive = Date.now();
+  syncTimers(P);
+  P.members.forEach((m, i) => { if (m.sse) send(m.sse, view(P, i)); });
+}
+
+function afterEngine(P) {
+  const G = P.G;
+  if (G.phase === 'roundover' && P.recorded !== G.round) {
+    recordRound(P);
+    P.recorded = G.round;
+  }
+  sync(P);
+}
+
+function handleCreate(body, res) {
+  let c;
+  do { c = randCode(); } while (parties.has(c));
+  const P = { code: c, status: 'lobby', members: [], G: null, lastActive: Date.now(), ver: 0, recorded: null };
+  parties.set(c, P);
+  const m = addMember(P, body.name);
+  sync(P);
+  json(res, 200, { code: c, token: m.token });
+}
+
+function handleJoin(body, res) {
+  const P = parties.get(String(body.code || '').toUpperCase());
+  if (!P) return json(res, 404, { error: 'Party nicht gefunden.' });
+  if (P.status === 'ended') return json(res, 400, { error: 'Diese Party ist beendet.' });
+  if (P.members.length >= MAX_MEMBERS) return json(res, 400, { error: 'Die Party ist voll (7 Spieler).' });
+  const m = addMember(P, body.name);
+  sync(P);
+  json(res, 200, { code: P.code, token: m.token });
+}
+
+function handleEvents(req, res, url) {
+  const P = parties.get((url.searchParams.get('code') || '').toUpperCase());
+  const tok = url.searchParams.get('token');
+  const m = P && P.members.find(x => x.token === tok);
+  if (!m) return json(res, 404, { error: 'Party oder Spieler nicht gefunden.' });
+  res.writeHead(200, { 'Content-Type': 'text/event-stream', 'Cache-Control': 'no-cache', Connection: 'keep-alive' });
+  res.write('retry: 2000\n\n');
+  if (m.sse) m.sse.end();
+  m.sse = res;
+  const ping = setInterval(() => res.write(': ping\n\n'), 20000);
+  sync(P);
+  req.on('close', () => {
+    clearInterval(ping);
+    if (m.sse === res) { m.sse = null; sync(P); }
+  });
+}
+
+function handleAction(body, res) {
+  const P = parties.get(String(body.code || '').toUpperCase());
+  const m = P && P.members.find(x => x.token === body.token);
+  if (!m) return json(res, 404, { error: 'Party oder Spieler nicht gefunden.' });
+  if (P.status === 'ended') return json(res, 400, { error: 'Die Party ist beendet.' });
+  const i = P.members.indexOf(m);
+  const idxs = body.idxs || [];
+  let err = null;
+
+  switch (body.type) {
+    case 'start':
+      if (i !== 0) err = 'Nur der Host kann starten.';
+      else if (P.status !== 'lobby') err = 'Das Spiel läuft schon.';
+      else if (P.members.length < 4) err = 'Mindestens 4 Spieler sind nötig.';
+      else {
+        P.G = E.newEngine(P.members.map(x => x.name));
+        P.status = 'playing';
+        E.startRound(P.G);
+      }
+      break;
+    case 'play': err = P.G ? E.play(P.G, i, idxs) : 'Es läuft kein Spiel.'; break;
+    case 'pass': err = P.G ? E.pass(P.G, i) : 'Es läuft kein Spiel.'; break;
+    case 'exchange': err = P.G ? E.exchange(P.G, i, idxs) : 'Es läuft kein Spiel.'; break;
+    case 'nextRound':
+      if (i !== 0) err = 'Nur der Host kann die nächste Runde starten.';
+      else if (!P.G || P.G.phase !== 'roundover') err = 'Die Runde läuft noch.';
+      else E.nextRound(P.G, P.members.slice(P.G.players.length).map(x => x.name));
+      break;
+    case 'end':
+      if (i !== 0) err = 'Nur der Host kann die Party beenden.';
+      else P.status = 'ended';
+      break;
+    case 'leave':
+      if (P.status !== 'lobby') err = 'Verlassen ist nur in der Lobby möglich.';
+      else {
+        P.members.splice(i, 1);
+        if (m.sse) m.sse.end();
+        if (!P.members.length) { parties.delete(P.code); return json(res, 200, { ok: true }); }
+      }
+      break;
+    default: err = 'Unbekannte Aktion.';
+  }
+
+  if (err) return json(res, 400, { error: err });
+  sync(P);
+  if (P.G) afterEngine(P);
+  json(res, 200, { ok: true });
+}
+
+function readBody(req) {
+  return new Promise((resolve, reject) => {
+    let d = '';
+    req.on('data', c => { d += c; if (d.length > 100000) req.destroy(); });
+    req.on('end', () => { try { resolve(d ? JSON.parse(d) : {}); } catch (e) { reject(e); } });
+  });
+}
+
+function sendFile(res, file, type) {
+  fs.readFile(path.join(__dirname, file), (err, data) => {
+    if (err) { res.writeHead(404); return res.end('Nicht gefunden'); }
+    res.writeHead(200, { 'Content-Type': type });
+    res.end(data);
+  });
+}
+
+// Parties ohne Verbindung und ohne Aktivität aufräumen
+setInterval(() => {
+  const now = Date.now();
+  for (const [c, P] of parties) {
+    const alive = P.members.some(m => m.sse);
+    if (!alive && now - P.lastActive > IDLE_MS) {
+      P.members.forEach(m => clearTimeout(m.timer));
+      parties.delete(c);
+    }
+  }
+}, 60000).unref();
+
+http.createServer(async (req, res) => {
+  const url = new URL(req.url, 'http://localhost');
+  try {
+    if (req.method === 'GET' && url.pathname === '/') { res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' }); return res.end(HTML); }
+    if (req.method === 'GET' && url.pathname === '/api/events') return handleEvents(req, res, url);
+    if (req.method === 'POST' && url.pathname === '/api/create') return handleCreate(await readBody(req), res);
+    if (req.method === 'POST' && url.pathname === '/api/join') return handleJoin(await readBody(req), res);
+    if (req.method === 'POST' && url.pathname === '/api/action') return handleAction(await readBody(req), res);
+    res.writeHead(404); res.end('Nicht gefunden');
+  } catch (e) {
+    if (!res.headersSent) json(res, 400, { error: 'Ungültige Anfrage.' });
+  }
+}).listen(PORT, () => console.log(`Kartenspiel-Server läuft auf Port ${PORT}`));
